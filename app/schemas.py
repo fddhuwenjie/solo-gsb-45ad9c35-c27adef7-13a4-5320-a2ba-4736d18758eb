@@ -231,3 +231,58 @@ class ArchiveVerifyRequest(BaseModel):
         pattern="^[0-9a-fA-F]{64}$",
         description="导出时返回的 SHA-256 摘要（64 位十六进制）",
     )
+
+
+# ---------------------------------------------------------------------------
+# 可离线往返的审阅包
+# ---------------------------------------------------------------------------
+
+
+class ReviewPackageCreate(BaseModel):
+    """创建审阅包：指定要离线审阅的批注 ID 集合（非空、不可重复）。
+
+    未完成批注的未完成传递前置项会被自动收录进同包；已完成且不可
+    确认的请求批注在响应的 ``excluded`` 中说明，不作为错误。
+    """
+
+    annotation_ids: List[Annotated[int, Field(ge=1)]] = Field(
+        min_length=1, description="要离线审阅的批注 ID 集合（自动收录未完成传递前置项）"
+    )
+    note: Optional[str] = Field(None, description="审阅包备注（随快照冻结）")
+
+
+class ReviewDecision(BaseModel):
+    """离线填写的一条审阅决定：确认歧义（confirm）或标记完成（complete）。
+
+    ``action`` 取值域在 :func:`app.review_packages.collect_decision_errors`
+    中整批校验（连同其余决定问题一次性带定位返回），故此处放宽为 str，
+    非法值不提前由 schema 拦截。
+    """
+
+    annotation_id: int = Field(ge=1)
+    action: str = Field(description="决定类型：confirm（确认歧义候选）或 complete（标记完成）")
+    start: Optional[int] = Field(
+        None, ge=0, description="confirm：所选候选范围起点（码点，含）"
+    )
+    end: Optional[int] = Field(
+        None, ge=0, description="confirm：所选候选范围终点（码点，不含）"
+    )
+    note: Optional[str] = Field(None, description="确认 / 完成备注")
+
+
+class ReviewPackageSubmit(BaseModel):
+    """审阅包回传：package_id、创建时的内容摘要与逐项决定。
+
+    决定的结构 / 合法性先离线对照冻结包校验（422，带 decisions[i] /
+    items[i] 定位）；通过后在写事务内检测冻结后的目标变化（409），
+    无冲突才按依赖顺序一次性写入。
+    """
+
+    package_id: str = Field(min_length=1, description="创建审阅包时返回的 package_id")
+    digest: str = Field(
+        pattern="^[0-9a-fA-F]{64}$",
+        description="创建审阅包时返回的内容摘要（64 位十六进制 SHA-256）",
+    )
+    decisions: List[ReviewDecision] = Field(
+        default_factory=list, description="逐项审阅决定（confirm / complete），可为空"
+    )

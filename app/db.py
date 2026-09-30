@@ -4,6 +4,9 @@
 不提供任何 UPDATE/DELETE 路径，人工确认以新行追加到 confirmations 表
 （同一 location 至多一条，由唯一索引 idx_confirm_loc_unique 保证），
 同名门禁策略的每次提交都以递增 revision 追加到 policy_revisions 表。
+审阅包（review_packages）创建时冻结快照并落库，成功回传后仅补记首次
+结果（applied_at / result_json 只写一次），同一 package_id 的重复回传
+原样返回首次结果，不重复追加确认或完成。
 """
 from __future__ import annotations
 
@@ -102,6 +105,21 @@ CREATE TABLE IF NOT EXISTS policy_revisions (
     UNIQUE (name, revision)
 );
 
+-- 可离线往返的审阅包：创建时在同一个读事务中冻结指定批注（含自动收录的
+-- 传递前置项）的最新迁移记录、候选范围、完成状态与全部传递前置状态，
+-- package_id 与内容摘要在创建后即固定；payload_json 为冻结内容本身，
+-- 离线回传只携带摘要与逐项决定。成功回传后 applied_at / result_json
+-- 记录首次结果：同一 package_id 再次回传原样返回，不重复写入。
+CREATE TABLE IF NOT EXISTS review_packages (
+    id           TEXT PRIMARY KEY,
+    document_id  INTEGER NOT NULL REFERENCES documents (id),
+    digest       TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    applied_at   TEXT,
+    result_json  TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_doc    ON versions (document_id, number);
 CREATE INDEX IF NOT EXISTS idx_locations_ann   ON locations (annotation_id);
 CREATE INDEX IF NOT EXISTS idx_locations_ver   ON locations (version_id);
@@ -114,6 +132,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_loc_unique
 CREATE INDEX IF NOT EXISTS idx_dependencies_doc ON dependencies (document_id);
 CREATE INDEX IF NOT EXISTS idx_completions_doc  ON completions (document_id);
 CREATE INDEX IF NOT EXISTS idx_policy_name      ON policy_revisions (name, revision);
+CREATE INDEX IF NOT EXISTS idx_review_packages_doc ON review_packages (document_id);
 """
 
 

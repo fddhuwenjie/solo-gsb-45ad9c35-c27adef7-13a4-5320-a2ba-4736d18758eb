@@ -48,6 +48,14 @@
   一次构建边界映射，整批 O(n + m)；越界、start > end、端点落入 UTF-16
   代理对或 UTF-8 多字节字符内部时整批 422 并指出条目与端点，绝不取整；
   接口只读，相同快照结果稳定。
+- 可离线往返的审阅包：创建时在同一个 SQLite 读事务中冻结指定批注的
+  最新迁移记录、候选范围、完成状态与全部传递前置状态（自动收录未完成
+  传递前置项），生成 package_id 与内容摘要，只收录当时可确认、可完成
+  或能由同包前置项解锁的条目；回传携带原摘要与逐项 confirm / complete
+  决定，目标已被确认、完成状态变化或新增版本改变最新位置时整包 409
+  且不写入，无冲突时在同一个写事务中按依赖顺序追加确认与完成
+  （后项可由前项解锁，任一决定非法全部回滚），同一 package_id 成功
+  回传后原样返回首次结果、不重复写入。
 """
 from __future__ import annotations
 
@@ -64,6 +72,7 @@ from . import coordinates as coords_mod
 from . import db
 from . import events as events_mod
 from . import gate as gate_mod
+from . import review_packages as rp_mod
 from .diffing import (
     classify_range,
     compute_segments,
@@ -97,6 +106,8 @@ from .schemas import (
     DocumentCreate,
     PolicyCreate,
     RedactionCreate,
+    ReviewPackageCreate,
+    ReviewPackageSubmit,
     VersionCreate,
 )
 
@@ -109,7 +120,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -127,7 +138,11 @@ app = FastAPI(
         "把全文划分为 covered / uncertain / uncovered 最大片段并无缝铺满；"
         "以及批量偏移换算：同一读事务按目标版本全文一次构建 "
         "codepoint / utf16 / utf8_byte 边界映射，整批 O(n+m) 互转半开区间，"
-        "代理对或多字节字符内部、越界、start>end 整批 422，绝不取整。"
+        "代理对或多字节字符内部、越界、start>end 整批 422，绝不取整；"
+        "以及可离线往返的审阅包：同一读事务冻结最新迁移记录、候选范围、"
+        "完成状态与全部传递前置状态并生成 package_id 与内容摘要，"
+        "回传时冲突整包 409 不写入，无冲突在同一写事务按依赖顺序追加"
+        "确认与完成，重复回传原样返回首次结果。"
     ),
     lifespan=lifespan,
 )
@@ -269,7 +284,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.8.0",
+        "version": "1.9.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -1639,6 +1654,252 @@ def verify_archive_endpoint(payload: ArchiveVerifyRequest):
             "confirmations": len(arch["confirmations"]),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 可离线往返的审阅包：同读事务冻结 → 离线填写 → 同写事务回传
+# ---------------------------------------------------------------------------
+
+
+@app.post("/documents/{document_id}/review-packages", status_code=201)
+def create_review_package(
+    document_id: int, payload: ReviewPackageCreate, con=Depends(get_db)
+):
+    """创建可离线往返的审阅包。
+
+    指定批注的最新迁移记录、候选范围、完成状态与全部传递前置状态在
+    **同一个 SQLite 读事务**（同一快照）中冻结；未完成批注的未完成
+    传递前置项自动收录进同包（保证后项可由同包前置项解锁）。只收录
+    当时可确认、可完成或能由同包前置项解锁的条目；已完成且不可确认
+    的请求批注在 ``excluded`` 中说明（不作为错误）。
+
+    冻结内容（``package``）规范化后计算 SHA-256 摘要，与随机
+    ``package_id`` 一起落库；审阅人离线保存 package + digest 后即可
+    逐项填写 confirm / complete 决定，回传时见
+    ``POST /review-packages/submit``。
+    """
+    requested = payload.annotation_ids
+    duplicates = sorted({aid for aid in requested if requested.count(aid) > 1})
+    if duplicates:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "审阅包创建请求校验失败，未冻结任何内容",
+                "errors": [
+                    {
+                        "error": "duplicate_annotation",
+                        "message": f"批注 {aid} 在 annotation_ids 中重复出现",
+                        "path": "annotation_ids",
+                        "annotation_id": aid,
+                    }
+                    for aid in duplicates
+                ],
+            },
+        )
+
+    package = None
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        errors = []
+        for i, aid in enumerate(requested):
+            row = con.execute(
+                "SELECT id, document_id FROM annotations WHERE id = ?", (aid,)
+            ).fetchone()
+            if row is None:
+                errors.append(
+                    {
+                        "error": "annotation_not_found",
+                        "message": f"批注 {aid} 不存在",
+                        "path": f"annotation_ids[{i}]",
+                        "annotation_id": aid,
+                    }
+                )
+            elif row["document_id"] != document_id:
+                errors.append(
+                    {
+                        "error": "cross_document",
+                        "message": f"批注 {aid} 属于文档 {row['document_id']}，"
+                        f"不能加入文档 {document_id} 的审阅包",
+                        "path": f"annotation_ids[{i}]",
+                        "annotation_id": aid,
+                    }
+                )
+        if errors:
+            status = 404 if any(e["error"] == "annotation_not_found" for e in errors) else 422
+            raise HTTPException(
+                status,
+                detail={"message": "审阅包创建请求校验失败，未冻结任何内容", "errors": errors},
+            )
+
+        package = rp_mod.build_package(
+            con, document_id, requested, note=payload.note
+        )
+        if not package["items"]:            raise HTTPException(
+                422,
+                detail={
+                    "message": "审阅包没有可收录的条目：请求的批注在冻结时均已"
+                    "完成且最新位置无需确认，未创建审阅包",
+                    "errors": [
+                        {
+                            "error": e["reason"],
+                            "message": e["message"],
+                            "path": "annotation_ids",
+                            "annotation_id": e["annotation_id"],
+                        }
+                        for e in package["excluded"]
+                    ],
+                },
+            )
+
+    # 摘要 / package_id 计算无需在事务内（只读结果已在内存中）
+    digest = rp_mod.compute_digest(package)
+    package_id = rp_mod.new_package_id()
+
+    # 冻结完成后落库（独立短写事务；读事务内只做只读查询，满足
+    # 「冻结发生在同一读事务」的要求）。冻结与落库之间即使有并发写入，
+    # 也只影响下一次创建的包：本包的 payload / digest 已是不可变快照。
+    with db.transaction(con):
+        con.execute(
+            "INSERT INTO review_packages (id, document_id, digest, payload_json)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                package_id,
+                document_id,
+                digest,
+                json.dumps(package, ensure_ascii=False),
+            ),
+        )
+        row = con.execute(
+            "SELECT created_at FROM review_packages WHERE id = ?", (package_id,)
+        ).fetchone()
+
+    return {
+        "package_id": package_id,
+        "document_id": document_id,
+        "format": rp_mod.PACKAGE_FORMAT,
+        "digest": digest,
+        "digest_algorithm": _DIGEST_DESCRIPTION,
+        "created_at": row["created_at"],
+        "included_count": len(package["items"]),
+        "excluded": package["excluded"],
+        "package": package,
+    }
+
+
+@app.post("/review-packages/submit", status_code=201)
+def submit_review_package(payload: ReviewPackageSubmit, response: Response, con=Depends(get_db)):
+    """回传离线填写的审阅包：冲突整包拒绝，无冲突按依赖顺序一次写入。
+
+    1. **离线结构校验**（不依赖当前数据库快照，422 一次性返回全部
+       带 ``decisions[i]`` / ``items[i]`` 定位的问题）：决定重复 /
+       针对包外条目 / action 非法 / 对不可确认项 confirm / 候选范围
+       缺失或不属于冻结候选 / 对冻结时已完成项 complete / complete
+       缺少同包前置决定；
+    2. **同写事务冲突检测**（BEGIN IMMEDIATE，409 整包不写入）：
+       目标已被人工确认、完成状态变化，或新增版本等使最新迁移记录
+       改变（版本 / 行 ID / 状态 / 范围 / 顺延引用）；冲突逐条定位；
+    3. **按依赖顺序应用**：确认按批注 ID 升序追加，完成按前置 →
+       后续拓扑顺序追加（后项由同包前项解锁）；任一决定在应用时
+       非法 → 全部回滚；
+    4. **幂等重放**：同一 package_id 成功回传后再次提交，原样返回
+       首次结果（200，``already_applied=true``），不重复写入；
+       重放时携带的 digest / decisions 与首次不同则 409。
+    """
+    package_id = payload.package_id
+    digest = payload.digest.strip().lower()
+
+    lookup = con.execute(
+        "SELECT id, document_id FROM review_packages WHERE id = ?", (package_id,)
+    ).fetchone()
+    if lookup is None:
+        raise HTTPException(404, f"审阅包 {package_id} 不存在（package_id 无法识别）")
+    document_id = lookup["document_id"]
+    decisions = [d.model_dump(exclude_none=True) for d in payload.decisions]
+
+    # 离线结构 / 语义校验：只依据冻结包，不查当前库（也不需要写锁）。
+    # 包行内容在写事务外预读一次用于校验；权威比对在下面的写事务内重做。
+    package = json.loads(
+        con.execute(
+            "SELECT payload_json FROM review_packages WHERE id = ?", (package_id,)
+        ).fetchone()["payload_json"]
+    )
+    decision_errors = rp_mod.collect_decision_errors(package, decisions)
+    if decision_errors:
+        raise HTTPException(
+            422,
+            detail={
+                "message": "审阅包回传决定校验失败，整包未处理（未写入任何确认或完成）",
+                "package_id": package_id,
+                "errors": [e.to_dict() for e in decision_errors],
+            },
+        )
+
+    decisions_by_annotation = {d["annotation_id"]: d for d in decisions}
+    with db.transaction(con):
+        # 取得写锁后重读包行：消除「事务外检查 applied_at」与真正写入之间的
+        # 竞态——并发回传在此处被 BEGIN IMMEDIATE 串行化，后到者必然看到
+        # 先到者提交的 applied_at / result_json，从而走幂等重放而非重复写入。
+        row = con.execute(
+            "SELECT * FROM review_packages WHERE id = ?", (package_id,)
+        ).fetchone()
+
+        if row["applied_at"] is not None:
+            if digest != row["digest"]:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "审阅包已成功回传过；本次携带的摘要与首次不同，"
+                        "不能覆盖首次结果",
+                        "errors": [
+                            {
+                                "error": "replay_mismatch",
+                                "message": "重复回传的 digest 与首次回传不一致",
+                                "path": "digest",
+                            }
+                        ],
+                    },
+                )
+            response.status_code = 200
+            result = rp_mod.replay_result(row)
+            result["already_applied"] = True
+            return result
+
+        if digest != row["digest"]:
+            raise HTTPException(
+                422,
+                detail={
+                    "message": "审阅包摘要不符：冻结内容被改动，或摘要不是创建时所得；"
+                    "本次回传未做任何写入",
+                    "errors": [
+                        {
+                            "error": "package_digest_mismatch",
+                            "message": "提交摘要与创建时冻结内容的 SHA-256 不一致",
+                            "path": "digest",
+                        }
+                    ],
+                },
+            )
+
+        package = json.loads(row["payload_json"])
+        conflicts = rp_mod.detect_conflicts(
+            con, document_id, package, decisions_by_annotation
+        )
+        if conflicts:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "审阅包冻结后目标状态已变化，整包未处理"
+                    "（未写入任何确认或完成），请重新创建审阅包",
+                    "package_id": package_id,
+                    "conflicts": [c.to_dict() for c in conflicts],
+                },
+            )
+        result = rp_mod.apply_package(
+            con, document_id, package, package_id, decisions
+        )
+
+    result["already_applied"] = False
+    return result
 
 
 # ---------------------------------------------------------------------------

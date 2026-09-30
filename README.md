@@ -51,6 +51,19 @@
 代理对或 UTF-8 多字节字符内部时**整批返回 422** 并指出条目与端点，
 绝不取整猜测。接口只读，同一快照结果稳定。
 
+最后支持**可离线往返的审阅包**（`POST /documents/{id}/review-packages`
+创建、`POST /review-packages/submit` 回传）：创建时在**同一个 SQLite
+读事务**中冻结指定批注的最新迁移记录、候选范围、完成状态与全部传递前置
+状态（未完成的传递前置项自动收录进同包），只收录当时可确认、可完成或
+能由同包前置项解锁的条目，生成 `package_id` 与规范化 JSON 的 SHA-256
+**内容摘要**；审阅人可完全离线保存包与摘要并逐项填写 `confirm` /
+`complete` 决定。回传携带原摘要与决定：若目标在冻结后已被确认、完成
+状态变化，或新增版本改变了最新位置，**整包返回带 `items[i]` 定位的
+409 冲突且不写入**；无冲突时在**同一个 SQLite 写事务**中先按批注 ID
+升序追加确认、再按前置→后续的拓扑顺序追加完成（**后项可由同包前项
+解锁**），任一决定非法则全部回滚。同一 `package_id` 成功回传后再次
+提交**原样返回首次结果（200，`already_applied=true`），不重复写入**。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -73,7 +86,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（230 个用例）
+pytest                                       # 运行测试（258 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -494,6 +507,85 @@ ID 列表顺序必然相同。
 schema 直接返回 422。接口不写入任何数据；版本内容只追加、不可变，
 同一版本下相同请求的响应序列化后**字节一致**。
 
+### 可离线往返的审阅包
+
+审阅包把「一批批注在某一时刻的审阅上下文」冻结成一个**自描述 JSON**，
+审阅人离线逐项做出「**确认歧义**（confirm）/ **标记完成**（complete）」
+决定后再回传；服务用创建时的摘要识别快照，并保证过期快照整包不写入。
+
+**创建**（`POST /documents/{id}/review-packages`，请求体
+`{"annotation_ids": [...], "note": ...}`）在**同一个 SQLite 读事务**
+（同一快照）中冻结每个条目的：
+
+| 冻结字段 | 内容 |
+|---|---|
+| `latest_location` | 该批注在文档最新版上的迁移记录：状态、范围、得分、**全部候选落点**、顺延引用与既有确认 |
+| `completed` | 冻结时是否已有完成记录 |
+| `prerequisite_ids` | 直接前置批注 ID |
+| `roles` | `requested`（请求指定）/ `prerequisite`（自动收录的传递前置） |
+| `prerequisite_states` | 全部传递前置的 `{completed, included}` 状态（含未收录的已完成前置，作为解锁依据） |
+
+**收录规则**——未完成批注的**未完成传递前置项会自动收录**进同包，
+因此每个被收录项都满足下列之一：**当时可确认**（最新位置是非顺延、
+未确认的歧义记录，已完成批注也允许补确认）、**当时可完成**（无未完成
+前置），或**能由同包前置项解锁**（其未完成前置全部在包内）。已完成且
+不可确认的请求批注不收录，在响应 `excluded` 中逐条说明
+（`already_completed`）；请求批注全部已完成时整条请求 422、不创建包。
+
+响应给出 `package_id`（随机 32 位十六进制，与内容无关——同内容两次
+创建是两个包）、`digest`（规范化 JSON 的 SHA-256，算法与迁移归档
+相同）与完整 `package`。`package` + `digest` 可拷贝到任意离线环境，
+摘要能用标准库独立复算：
+
+```python
+digest = hashlib.sha256(
+    json.dumps(package, ensure_ascii=False, sort_keys=True,
+               separators=(",", ":")).encode("utf-8")).hexdigest()
+```
+
+**离线填写**：审阅人只需在 `decisions` 中逐项给出决定，无需查库：
+
+| action | 必填字段 | 含义 |
+|---|---|---|
+| `confirm` | `start` / `end`（+ 可选 `note`） | 从该条目冻结的候选落点中选定一个 |
+| `complete` | 可选 `note` | 标记批注审阅完成 |
+
+**回传**（`POST /review-packages/submit`，请求体
+`{"package_id", "digest", "decisions"}`）分三关：
+
+1. **离线结构 / 语义校验（422，不写库）**：只依据冻结包，一次性返回
+   全部带定位的问题——重复决定（`decisions[i]`）、针对包外批注
+   （`decision_not_in_package`）、非法 `action`、对不可确认项
+   `confirm`（`not_confirmable`）、候选范围缺失 / 不属于冻结候选
+   （`missing_candidate_range` / `confirmation_not_candidate`）、对冻结时
+   已完成项 `complete`（`already_completed`），以及 `complete` 决定的
+   未完成传递前置没有在同包决定中一并完成
+   （`missing_prerequisite_decisions`，定位 `items[i]`）；
+2. **同写事务冲突检测（409，整包不写入）**：在 BEGIN IMMEDIATE 取得
+   写锁后逐项比对当前库与冻结快照，冲突一次性列在 `detail.conflicts`，
+   每条带 `items[i]` / `annotation_id`：
+
+   | 冲突 error | 触发条件 |
+   |---|---|
+   | `latest_location_changed` | 新增版本等使最新迁移记录改变（版本 / 行 ID / 状态 / 范围 / 顺延引用任一不同） |
+   | `already_confirmed` | `confirm` 目标在冻结后已被他人人工确认 |
+   | `completion_state_changed` | 条目完成状态与冻结时不一致（已完成 ↔ 未完成） |
+   | `external_blocker` | 冻结后新增依赖边，使 `complete` 决定被包外未完成前置阻塞 |
+
+3. **按依赖顺序应用（201）**：确认按批注 ID 升序追加，完成按
+   **前置 → 后续的拓扑顺序**追加——决定列表的提交顺序无关，后项由
+   同包前项即时解锁；应用阶段再次核对每条记录（他人持锁期间的变化），
+   任一决定非法都**整体回滚**。响应返回追加的 `confirmations` /
+   `completions` 与 `unlocked_annotation_ids`（应用前被阻塞、应用后可
+   处理的批注，含包外同文档批注）。
+
+**幂等**：审阅包行只追加；成功回传只补记一次 `applied_at` / 首次结果。
+同一 `package_id` 再次提交（即使决定列表不同）返回 **200** 与首次结果
+（`already_applied=true`），不产生任何新行；重放时携带的摘要与首次
+不同则 409（`replay_mismatch`）。创建后被篡改的包会在回传第一关因
+`package_digest_mismatch` 被 422 拒绝。无法识别的 `package_id` 返回
+404。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -526,6 +618,8 @@ schema 直接返回 422。接口不写入任何数据；版本内容只追加、
 | GET | `/documents/{id}/gate/evaluate?policy=&revision=&version=` | 同一读事务快照评估门禁，返回不短路的同形解释树 |
 | POST | `/documents/{id}/redact` | 批注驱动的脱敏副本：合并生效范围替换为占位，返回脱敏全文与源/结果码点区间映射（只读） |
 | GET | `/documents/{id}/events?limit=&cursor=` | 文档增量事件流：六类只追加记录按 (created_at, type_rank, id) 稳定合并，水位向量 + 续页/续拉游标分页（只读） |
+| POST | `/documents/{id}/review-packages` | 创建可离线往返的审阅包：同一读事务冻结最新迁移记录/候选/完成状态/全部传递前置，返回 package_id 与内容摘要 |
+| POST | `/review-packages/submit` | 回传审阅包：离线校验决定(422)→同写事务冲突检测(409,整包不写入)→按依赖顺序追加确认与完成；重复回传返回首次结果 |
 
 ## 完整示例
 
@@ -1167,11 +1261,144 @@ curl -X POST $B/documents/1/versions/1/coordinates \
 # 7. 只读且确定：不新增批注 / 迁移记录；相同请求多次调用结果字节一致。
 ```
 
+可离线往返的审阅包完整示例（**创建 → 离线保存与填写 → 回传 → 幂等重放**）：
+
+```bash
+B=http://localhost:8000
+
+# 1. 新建文档「甲乙丙」并建 3 条批注（1/2/3），依赖 1→3、2→3；
+#    再提交第 2 版「甲丙甲」：批注 1 两处并列 → ambiguous（候选 [0,1) 与 [2,3)）
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "离线审阅包示例", "content": "甲乙丙"
+}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注甲","selection":"甲","start":0,"end":1}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注乙","selection":"乙","start":1,"end":2}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注丙","selection":"丙","start":2,"end":3}'
+curl -X POST $B/documents/1/dependencies -H 'Content-Type: application/json' -d '{
+  "relations": [
+    {"prerequisite_id": 1, "dependent_id": 3},
+    {"prerequisite_id": 2, "dependent_id": 3}
+  ]
+}'
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content":"甲丙甲"}'
+
+# 2. 【创建】只请求批注 3：未完成的传递前置 1、2 被自动收录进同包。
+#    同一读事务冻结三条批注的最新迁移记录 / 候选 / 完成状态 / 前置状态，
+#    返回 package_id（32 位十六进制）与内容摘要 digest；把整个响应存到
+#    package.json 后即可带离网络离线填写
+curl -X POST $B/documents/1/review-packages -H 'Content-Type: application/json' -d '{
+  "annotation_ids": [3], "note": "离线评审一轮"
+}' -o package.json
+python3 -c "import json; d=json.load(open('package.json')); print(d['package_id']); print(d['digest'])"
+# → b83bab5613fa431ca162120f9d7d9685
+# → <64 位十六进制 SHA-256>
+python3 -c "import json; d=json.load(open('package.json'))['package']; \
+print([(i['annotation_id'], i['roles'], i['latest_location']['status']) for i in d['items']])"
+# → [(1, ['prerequisite'], 'ambiguous'),
+#    (2, ['prerequisite'], 'unresolved'),
+#    (3, ['requested'],   'resolved')]
+python3 -c "import json; print(json.load(open('package.json'))['package']['prerequisite_states'])"
+# → {'1': {'completed': False, 'included': True},
+#    '2': {'completed': False, 'included': True}}
+
+# 3. 【离线】摘要可完全不经过本服务复算（与归档同一套规范化 JSON 算法）
+python3 - <<'PY'
+import hashlib, json
+d = json.load(open("package.json"))
+canon = json.dumps(d["package"], ensure_ascii=False,
+                   sort_keys=True, separators=(",", ":"))
+assert hashlib.sha256(canon.encode("utf-8")).hexdigest() == d["digest"]
+print("离线复算摘要一致")
+PY
+
+# 4. 【离线填写】审阅人只决定每条批注 confirm 还是 complete（决定顺序无关）。
+#    本例：1、2 完成后解锁 3，故三条都给 complete；歧义位置稍后用第二个包确认。
+cat > decisions.json <<'JSON'
+{
+  "package_id": "b83bab5613fa431ca162120f9d7d9685",
+  "digest": "……把 package.json 中的 digest 原样填入……",
+  "decisions": [
+    {"annotation_id": 3, "action": "complete", "note": "丙：终审"},
+    {"annotation_id": 1, "action": "complete", "note": "甲：通过（歧义位置另开确认包）"},
+    {"annotation_id": 2, "action": "complete", "note": "乙：通过"}
+  ]
+}
+JSON
+
+# 5. 离线自校验：若只 complete 3 而漏掉前置 1、2，回传第一关 422
+#    （missing_prerequisite_decisions，定位 items[2]，不写任何数据）
+curl -X POST $B/review-packages/submit -H 'Content-Type: application/json' -d '{
+  "package_id": "b83bab5613fa431ca162120f9d7d9685",
+  "digest": "……同上……",
+  "decisions": [{"annotation_id": 3, "action": "complete"}]
+}'
+# → 422 {"detail":{"message":"审阅包回传决定校验失败，整包未处理……",
+#    "errors":[{"error":"missing_prerequisite_decisions",
+#      "message":"批注 3 的 complete 决定无法在同包内解锁：传递前置 [1, 2] 既未在冻结前完成，也未在本包决定中一并完成",
+#      "path":"items[2]","annotation_id":3}]}}
+
+# 6. 【回传】决定齐全：同一写事务内按依赖拓扑顺序 1→2→3 追加完成
+#    （与提交顺序无关），任一非法则整批回滚
+curl -X POST $B/review-packages/submit -H 'Content-Type: application/json' \
+  --data @decisions.json
+# → 201
+# {"package_id":"b83bab...","applied_at":"2026-09-30T21:09:41.756Z",
+#  "confirmation_count":0,"completion_count":3,
+#  "completions":[{"annotation_id":1,"completion_id":1,"note":"甲：通过……"},
+#                 {"annotation_id":2,"completion_id":2,"note":"乙：通过"},
+#                 {"annotation_id":3,"completion_id":3,"note":"丙：终审"}],
+#  "unlocked_annotation_ids":[],"already_applied":false}
+
+# 7. 【幂等重放】同一 package_id 再提交（哪怕决定列表为空 / 不同）：
+#    原样返回首次结果，200 + already_applied=true，不新增任何行
+curl -X POST $B/review-packages/submit -H 'Content-Type: application/json' -d '{
+  "package_id": "b83bab5613fa431ca162120f9d7d9685",
+  "digest": "……同上……", "decisions": []
+}'
+# → 200 {"completion_count":3, ..., "already_applied":true}
+
+# 8. 【确认包】批注 1 已完成，但它在第 2 版的歧义仍可确认 → 单独再开一个包；
+#    从冻结候选中选定 [0,1)。注意：confirm 不等于 complete，它不会解锁后续，
+#    解锁完成依赖链必须用 complete（这也是第 5 步漏前置会被拒绝的原因）
+curl -X POST $B/documents/1/review-packages -H 'Content-Type: application/json' -d \
+  '{"annotation_ids":[1]}'
+# → items[0]: {"annotation_id":1,"completed":true,
+#              "latest_location":{"status":"ambiguous",
+#                "candidates":[{"start":0,"end":1,...},{"start":2,"end":3,...}]}}
+curl -X POST $B/review-packages/submit -H 'Content-Type: application/json' -d '{
+  "package_id": "……确认包的 package_id……", "digest": "……确认包摘要……",
+  "decisions": [
+    {"annotation_id": 1, "action": "confirm", "start": 0, "end": 1, "note": "取首处"}
+  ]
+}'
+# → 201 {"confirmation_count":1,
+#        "confirmations":[{"annotation_id":1,"location_id":4,"start":0,"end":1}],
+#        "completion_count":0,"already_applied":false}
+
+# 9. 【冲突整包不写入】冻结之后若有人提交了新版本（最新迁移记录改变）、
+#    抢先确认了目标，或抢先完成了批注，回传 409 并逐项定位，不写入：
+#    冻结批注 4 → 外部提交第 2 版 → 再回传 complete
+curl -X POST $B/review-packages/submit -H 'Content-Type: application/json' -d '{
+  "package_id": "……过期包的 package_id……", "digest": "……过期包摘要……",
+  "decisions": [{"annotation_id": 4, "action": "complete"}]
+}'
+# → 409 {"detail":{"message":"审阅包冻结后目标状态已变化，整包未处理……",
+#    "conflicts":[{"error":"latest_location_changed",
+#      "message":"批注 4 的最新位置已变化：最新版本由第 1 版变为第 2 版（新增版本改变了最新位置）；范围由 [0, 1) 变为 [1, 2)；迁移记录行由 7 变为 8，……",
+#      "path":"items[0]","annotation_id":4}]}}
+# 其他冲突 error：already_confirmed（冻结后被他人确认）、
+# completion_state_changed（完成状态变化）、external_blocker（新增依赖引入包外未完成前置）
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件与批量偏移换算接口）
+  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、覆盖图、增量事件、批量偏移换算与离线审阅包接口）
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
@@ -1181,8 +1408,9 @@ app/
   events.py     # 文档增量事件流：六表水位向量、(created_at, type_rank, id) 稳定合并、续页/续拉游标编解码
   coordinates.py  # 批量偏移换算：全文一次扫描构建 codepoint/utf16/utf8_byte 边界映射，端点 O(1) 查表与整批校验（纯函数）
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
+  review_packages.py # 离线审阅包：同读事务冻结快照/自动收录传递前置、离线决定整批校验、回传冲突检测与同写事务按依赖顺序应用、首次结果幂等重放
   db.py         # SQLite 连接、建表、读写事务
-  schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求与批量偏移换算模型）
+  schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、批量偏移换算与审阅包模型）
 tests/
   test_matching.py  # 匹配算法单元测试
   test_diffing.py   # 编辑片段/投影/分类单元测试
@@ -1195,6 +1423,7 @@ tests/
   test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
   test_coordinates.py # 批量偏移换算测试（emoji/组合字符/中文边界、代理对与多字节内部422、越界/start>end、200上限、只读与字节稳定）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
+  test_review_packages.py # 离线审阅包测试（同事务冻结/自动收录前置/离线整批校验/四类冲突不写入/依赖顺序应用/回滚/幂等重放/并发）
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖
