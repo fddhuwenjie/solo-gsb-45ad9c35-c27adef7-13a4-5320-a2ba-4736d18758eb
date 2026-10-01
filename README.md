@@ -51,6 +51,19 @@
 代理对或 UTF-8 多字节字符内部时**整批返回 422** 并指出条目与端点，
 绝不取整猜测。接口只读，同一快照结果稳定。
 
+最后提供**可离线往返的审阅包**（创建 `POST /documents/{id}/review-packages`、
+回传 `POST /documents/{id}/review-packages/submit`）：创建时在**同一个
+SQLite 读事务**（同一快照）中冻结指定批注的**最新迁移记录**（状态、范围、
+匹配依据、全部候选范围）、**完成状态**、当时是否已确认以及**全部传递前置
+状态**（前置项同样冻结最新位置），生成 `package_id` 与包内容 SHA-256
+摘要；只收录当时**可确认**、**可完成**或**能由同包前置项解锁**的条目。
+审阅人可保存包体完全离线地填写确认 / 完成决定。回传时原样携带包体、摘要
+与每项决定：目标已被确认、完成状态变化或新增版本改变了最新位置时，**整包
+返回带 `items[i]` 定位的冲突（409）且不写入**；无冲突时在**同一个写事务**
+中按**包内依赖顺序**追加确认与完成（后项可由前项解锁），任一决定非法则
+**全部回滚**。同一 `package_id` 的成功回传返回首次结果（`replay=true`），
+**不重复写入**。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -73,7 +86,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（230 个用例）
+pytest                                       # 运行测试（250 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -254,6 +267,77 @@ digest = hashlib.sha256(
 
 > 摘要不符意味着归档来源已不可信，此时只报 `digest_mismatch`，
 > 不再对被篡改内容做进一步语义检查。
+
+### 可离线往返的审阅包
+
+审阅人可能在**离线环境**中工作：先在有网络时「打包」一批批注的当前状态，
+离线期间逐项给出人工确认与完成决定，恢复网络后再整包回传。审阅包保证
+回传结果与创建时的数据库状态严格对齐，且确认与完成仍遵循只追加、依赖
+解锁与整包原子性。
+
+**创建（冻结，只读）**——`POST /documents/{id}/review-packages`，请求体
+`{"annotation_ids": [...]}`。服务在**同一个 SQLite 读事务**（同一快照）中为
+每条请求批注冻结：
+
+| 冻结字段 | 内容 |
+|---|---|
+| `latest` | **最新版本上的迁移记录**：`location_id` / `version_number` / 状态 / 范围 / 匹配依据 / **全部候选范围** / 顺延标记 / 当时是否已确认 |
+| `completed` | 创建时是否已有完成记录 |
+| `prerequisite_ids` / `transitive_prerequisite_ids` | 直接与**全部传递前置**批注 ID |
+| `transitive_prerequisites_completed` | 全部传递前置项当时是否均已完成 |
+| `actions` | 该条目离线允许的决定：`confirm`（最新位置为非顺延的未确认歧义）/ `complete` |
+| `requested` | 是否为显式请求项（`false` 表示只是随包冻结的传递前置项快照） |
+
+响应返回 `package_id`（`rp_` + 32 位十六进制）与 `digest`（包内容规范化
+JSON 的 SHA-256，算法与[迁移归档](#迁移归档导出与离线核验)相同）。
+包内条目已按**依赖拓扑序**排列（前置在前，同层按批注 ID 升序）。
+
+**收录规则**——只收录当时**可确认**、**可完成**或**能由同包前置项解锁**的
+条目：若某请求项的未完成传递前置项不在请求列表中（后项无法被同包解锁），
+或条目已完成且最新位置无需确认，整批 **422** 拒绝，`detail.errors` 一次性
+列出全部问题并按 `annotation_ids[i]` 定位（错误码
+`blocked_by_outside_prerequisite` / `nothing_to_decide` /
+`duplicate_annotation` / `annotation_not_found` / `cross_document`），
+**不生成包**。需要连带处理前置项时，把它们一并加入 `annotation_ids`。
+
+**离线填写**——包体是自描述 JSON，可在离线环境保存；审阅人按
+`items[].actions` 为每个显式请求项（`requested=true`）给出决定：
+
+```json
+{"annotation_id": 7, "confirm": true, "complete": true,
+ "start": 13, "end": 17, "note": "取后一处并完成"}
+```
+
+`confirm=true` 时 `start` / `end` 必须是该条目冻结候选之一；只确认不完成
+也合法（确认不解锁后续，完成才解锁）。
+
+**回传（应用）**——`POST /documents/{id}/review-packages/submit`，原样携带
+`package_id`、`digest`、`package` 与 `decisions`。服务在**同一个
+BEGIN IMMEDIATE 写事务**内：
+
+1. 复算摘要并校验归属 / 决定目标（包体被改动 → `digest_mismatch`，422）；
+2. 逐条做**冲突检测**——下列任一发生则整包 **409**，`detail.errors` 按
+   `items[i]` 定位，**不写入任何一行**：
+
+   | 错误码 | 含义 |
+   |---|---|
+   | `location_confirmed` | 目标歧义记录在包创建后已被（他人）确认 |
+   | `already_completed` | 目标在包创建后已被完成，包内完成决定会重复 |
+   | `latest_location_changed` | 冻结后出现新版本，最新迁移记录已不是冻结时那条 |
+   | `prerequisites_changed` | 依赖图新增 / 移除了传递前置项 |
+
+3. 无冲突后按**包内拓扑序**逐条追加：确认范围必须属于冻结候选
+   （`bad_candidate`），完成决定要求应用到该条时全部传递前置项已完成
+   （包外前置冻结时已完成，包内前置由同包前项解锁；否则 `blocked`）。
+   **任一决定非法则整批回滚**（422，不留下任何半成品）。
+
+响应按应用顺序给出每条 `results`（`confirmed` / `completed` /
+`confirmation_id` / `completion_id` / `unlocked_annotation_ids`）。
+**幂等**：同一 `package_id` 的成功回传再次提交时直接返回首次结果
+（HTTP 200，`replay=true`），**不重复写入**确认、完成或包记录；
+把同一包回传到其他文档返回 422（`cross_document_package`）。
+
+完整示例见下文「[审阅包：创建、离线填写与回传](#审阅包创建离线填写与回传完整示例)」。
 
 ### 文档发布门禁
 
@@ -519,6 +603,8 @@ schema 直接返回 422。接口不写入任何数据；版本内容只追加、
 | GET | `/documents/{id}/completions` | 文档下全部完成记录（只追加） |
 | GET | `/documents/{id}/archive` | 同一读事务导出规范 JSON 归档与 SHA-256 摘要 |
 | POST | `/archives/verify` | 离线核验归档（不查库、不写入；缺行/串文档/篡改/摘要不符返回可定位错误） |
+| POST | `/documents/{id}/review-packages` | 创建离线审阅包：同一读事务冻结最新迁移记录/候选/完成状态/全部传递前置，生成 package_id 与摘要（只读） |
+| POST | `/documents/{id}/review-packages/submit` | 回传审阅包：冲突整包 409 不写入；无冲突按包内依赖顺序同一写事务追加确认与完成，非法决定整批回滚，重复回传幂等 |
 | POST | `/policies` | 提交发布门禁策略（语法整树校验，按名称只追加修订） |
 | GET | `/policies` | 全部策略的最新修订（按名称升序） |
 | GET | `/policies/{name}` | 某策略的全部修订（按修订号升序） |
@@ -762,6 +848,111 @@ PY
 #    {"error":"missing_location",
 #     "message":"批注 1 缺少第 4 版的迁移记录（该批注创建于第 1 版，末版为第 5 版）",
 #     "path":"annotations[0]"}
+```
+
+<a id="审阅包创建离线填写与回传完整示例"></a>
+审阅包：创建、离线填写与回传完整示例：
+
+```bash
+B=http://localhost:8000
+
+# 0. 准备：文档「说：目标。开头。」，批注 1=目标（前置）、批注 2=开头（后续），
+#    依赖 1→2；提交第 2 版后批注 1 在两处候选间歧义
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "审阅包示例", "content": "说：目标。开头。"
+}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注一","selection":"目标","left_context":"说：","right_context":"。","start":2,"end":4}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注二","selection":"开头","start":5,"end":7}'
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content":"说：目标。说：目标。"}'
+# → results[0]: ambiguous, candidates = [{"start":2,"end":4,...},{"start":8,"end":10,...}]
+curl -X POST $B/documents/1/dependencies -H 'Content-Type: application/json' -d '{
+  "relations":[{"prerequisite_id":1,"dependent_id":2}]
+}'
+
+# 1. 创建审阅包：把批注 1、2 一起打包（2 被 1 阻塞，必须同包才能由前项解锁）。
+#    只读不写库；响应保存为 package.json
+curl -s -X POST $B/documents/1/review-packages \
+  -H 'Content-Type: application/json' \
+  -d '{"annotation_ids":[1,2]}' -o package.json
+python3 -m json.tool package.json | head -40
+# → 201
+# {"document_id":1,
+#  "package_id":"rp_9f2c...（共 35 字符）",
+#  "format":"review-package/1",
+#  "digest":"....（64 位十六进制 SHA-256）",
+#  "package":{"format":"review-package/1","document_id":1,"created_at":"...",
+#    "items":[
+#      {"annotation_id":1,"requested":true,"completed":false,
+#       "transitive_prerequisite_ids":[],
+#       "actions":{"confirm":true,"complete":true},
+#       "latest":{"status":"ambiguous","version_number":2,
+#                 "candidates":[{"start":2,"end":4,...},{"start":8,"end":10,...}], ...}},
+#      {"annotation_id":2,"requested":true,"completed":false,
+#       "transitive_prerequisite_ids":[1],
+#       "transitive_prerequisites_completed":false,
+#       "actions":{"confirm":false,"complete":true},
+#       "latest":{"status":"resolved", ...}}]}}
+
+# 只打包被阻塞的批注 2 会被整批拒绝（前置 1 不在包内，后项无法解锁）
+curl -X POST $B/documents/1/review-packages -H 'Content-Type: application/json' \
+  -d '{"annotation_ids":[2]}'
+# → 422 {"detail":{"errors":[{"error":"blocked_by_outside_prerequisite",
+#     "message":"批注 2 被未完成的传递前置项 [1] 阻塞，且这些前置项不在本包请求列表中……",
+#     "path":"annotation_ids[0]"}]}}
+
+# 2. 离线填写：审阅人在离线环境中保存 package.json，按 items[].actions 决定：
+#    批注 1 选定候选 [8,10) 并完成；批注 2 完成（回传时由同包前项 1 解锁）。
+#    下面用 Python 把原包、原摘要与决定组装为回传请求（也可手工编辑）
+python3 - <<'PY'
+import json
+created = json.load(open("package.json"))
+submit_body = {
+    "package_id": created["package_id"],
+    "digest": created["digest"],
+    "package": created["package"],          # 原样回传
+    "decisions": [
+        {"annotation_id": 1, "confirm": True, "complete": True,
+         "start": 8, "end": 10, "note": "离线确认：取后一处，并完成"},
+        {"annotation_id": 2, "complete": True, "note": "离线完成"},
+    ],
+}
+json.dump(submit_body, open("submit.json", "w"), ensure_ascii=False)
+print("已离线生成 submit.json")
+PY
+
+# 3. 回传：同一写事务内先做冲突检测，无冲突后按包内拓扑序（1 先 2 后）追加
+curl -s -X POST $B/documents/1/review-packages/submit \
+  -H 'Content-Type: application/json' --data-binary @submit.json | python3 -m json.tool
+# → 201
+# {"replay":false,"package_id":"rp_9f2c...","document_id":1,"digest":"...",
+#  "confirmed_count":1,"completed_count":2,
+#  "results":[
+#    {"annotation_id":1,"confirmed":true,"completed":true,
+#     "confirmation_id":1,"completion_id":1,"unlocked_annotation_ids":[2]},
+#    {"annotation_id":2,"confirmed":false,"completed":true,
+#     "confirmation_id":null,"completion_id":2,"unlocked_annotation_ids":[]}]}
+
+# 4. 幂等：携带同一 package_id 再次回传 → 200 replay=true，返回首次结果，
+#    confirmations / completions / review_packages 均不新增行
+curl -s -X POST $B/documents/1/review-packages/submit \
+  -H 'Content-Type: application/json' --data-binary @submit.json | python3 -m json.tool
+# → 200 {"replay":true, ... "results":[...与首次完全相同...]}
+
+# 5. 冲突一例：重新打包当前已完成状态不可行（无决定可执行）；改用新场景：
+#    对仍有歧义的批注先创建包，回传前由他人在线确认 / 完成，或文档出了新版，
+#    整包返回 409 并按 items[i] 定位，不写入任何决定：
+#    {"detail":{"errors":[{"error":"location_confirmed",
+#       "message":"批注 1 的歧义记录 location 3 在包创建后已被人工确认（确认行 ……）……",
+#       "path":"items[0]"}]}}
+# 其他冲突码：already_completed（目标回传前已完成）、
+#   latest_location_changed（新版本改变了最新迁移记录）、
+#   prerequisites_changed（依赖图新增了传递前置项）。
+
+# 6. 非法决定一例：确认范围不在冻结候选中 → 422 bad_candidate，整批回滚，
+#    同包内其他决定也不会落库；包体被改动而摘要未更新 → 422 digest_mismatch。
 ```
 
 文档发布门禁完整流程示例：
@@ -1181,8 +1372,9 @@ app/
   events.py     # 文档增量事件流：六表水位向量、(created_at, type_rank, id) 稳定合并、续页/续拉游标编解码
   coordinates.py  # 批量偏移换算：全文一次扫描构建 codepoint/utf16/utf8_byte 边界映射，端点 O(1) 查表与整批校验（纯函数）
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
+  packages.py   # 可离线往返的审阅包：同读事务冻结最新位置/候选/完成/全部传递前置，回传冲突定位 + 同写事务按拓扑序追加（幂等不重写）
   db.py         # SQLite 连接、建表、读写事务
-  schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求与批量偏移换算模型）
+  schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、审阅包冻结/回传与批量偏移换算模型）
 tests/
   test_matching.py  # 匹配算法单元测试
   test_diffing.py   # 编辑片段/投影/分类单元测试
@@ -1195,6 +1387,7 @@ tests/
   test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
   test_coordinates.py # 批量偏移换算测试（emoji/组合字符/中文边界、代理对与多字节内部422、越界/start>end、200上限、只读与字节稳定）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
+  test_packages.py  # 离线审阅包测试（冻结收录/包外前置422/冲突409不写入/非法决定回滚/拓扑解锁/幂等重放）
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖

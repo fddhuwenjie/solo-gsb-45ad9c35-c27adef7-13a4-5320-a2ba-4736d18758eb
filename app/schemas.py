@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Annotated, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DocumentCreate(BaseModel):
@@ -230,4 +230,140 @@ class ArchiveVerifyRequest(BaseModel):
     digest: str = Field(
         pattern="^[0-9a-fA-F]{64}$",
         description="导出时返回的 SHA-256 摘要（64 位十六进制）",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 可离线往返的审阅包
+#
+# 冻结包结构一律 extra="forbid"：回传时包体多一个字段即视为结构错误，
+# 保证摘要复算基于与创建时完全一致的内容（摘要算法与归档相同）。
+# ---------------------------------------------------------------------------
+
+
+class ReviewPackageCreate(BaseModel):
+    """创建离线审阅包：指定要冻结的批注 ID 列表（非空）。"""
+
+    annotation_ids: List[Annotated[int, Field(ge=1)]] = Field(
+        min_length=1, description="要冻结到审阅包中的批注 ID（至少一条）"
+    )
+
+
+class FrozenCandidate(BaseModel):
+    """冻结候选范围及其匹配依据（结构同迁移记录中的候选项）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: int
+    end: int
+    left_match: int
+    right_match: int
+    score: int
+
+
+class FrozenConfirmation(BaseModel):
+    """冻结时该迁移记录上既有的人工确认。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    note: Optional[str]
+    created_at: str
+
+
+class FrozenLocation(BaseModel):
+    """冻结的最新迁移记录全貌（无迁移记录时 status=missing、各 ID 为 null）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    location_id: Optional[int] = Field(None, ge=1)
+    version_number: Optional[int] = Field(None, ge=1)
+    version_id: Optional[int] = Field(None, ge=1)
+    status: Literal["resolved", "ambiguous", "unresolved", "missing"]
+    start: Optional[int] = None
+    end: Optional[int] = None
+    left_match: Optional[int] = None
+    right_match: Optional[int] = None
+    score: Optional[int] = None
+    candidates: List[FrozenCandidate]
+    carried_from: Optional[int] = Field(None, ge=1)
+    carried_forward: bool
+    confirmed: bool
+    confirmation: Optional[FrozenConfirmation] = None
+
+
+class FrozenActions(BaseModel):
+    """该条目在包内允许执行的离线决定。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool
+    complete: bool
+
+
+class ReviewPackageItem(BaseModel):
+    """审阅包中的一条冻结条目（批注 + 最新位置 + 前置状态 + 允许的决定）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    annotation_id: int = Field(ge=1)
+    body: str
+    requested: bool = Field(description="是否为创建时显式请求的批注（false 为传递前置项）")
+    completed: bool
+    prerequisite_ids: List[int]
+    transitive_prerequisite_ids: List[int]
+    transitive_prerequisites_completed: bool
+    actions: FrozenActions
+    latest: FrozenLocation
+
+
+class ReviewPackage(BaseModel):
+    """冻结的审阅包内容（创建接口的 package 字段原样回传）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: str
+    document_id: int = Field(ge=1)
+    created_at: str
+    items: List[ReviewPackageItem]
+
+
+class ReviewPackageDecision(BaseModel):
+    """离线填写的一条决定：对某条批注执行确认（从冻结候选中选定）和 / 或完成。
+
+    ``confirm=true`` 时必须给出属于冻结候选的 ``start`` / ``end``；
+    ``confirm`` 与 ``complete`` 至少一个为 true。
+    """
+
+    annotation_id: int = Field(ge=1)
+    confirm: bool = False
+    complete: bool = False
+    start: Optional[int] = Field(None, ge=0)
+    end: Optional[int] = Field(None, ge=0)
+    note: Optional[str] = Field(None, description="确认 / 完成备注")
+
+    @model_validator(mode="after")
+    def _validate_decision(self):
+        if not self.confirm and not self.complete:
+            raise ValueError("confirm 与 complete 至少一个必须为 true")
+        if self.confirm and (self.start is None or self.end is None):
+            raise ValueError("confirm=true 时必须提供候选范围的 start 与 end")
+        return self
+
+
+class ReviewPackageSubmit(BaseModel):
+    """审阅包回传：原包内容、原摘要、package_id 与离线填写的各项决定。"""
+
+    package_id: str = Field(
+        pattern="^rp_[0-9a-f]{32}$",
+        description="创建时返回的 package_id（rp_ + 32 位十六进制）",
+    )
+    digest: str = Field(
+        pattern="^[0-9a-fA-F]{64}$",
+        description="创建时返回的 SHA-256 内容摘要（64 位十六进制）",
+    )
+    package: ReviewPackage
+    decisions: List[ReviewPackageDecision] = Field(
+        min_length=1, description="每项确认或完成决定（至少一条）"
     )

@@ -1,9 +1,10 @@
 """SQLite 存储层。
 
-版本、迁移结果、审阅依赖、完成记录与门禁策略修订均只追加（append-only）：
-不提供任何 UPDATE/DELETE 路径，人工确认以新行追加到 confirmations 表
-（同一 location 至多一条，由唯一索引 idx_confirm_loc_unique 保证），
-同名门禁策略的每次提交都以递增 revision 追加到 policy_revisions 表。
+版本、迁移结果、审阅依赖、完成记录、成功回传的离线审阅包与门禁策略修订均只追加
+（append-only）：不提供任何 UPDATE/DELETE 路径，人工确认以新行追加到
+confirmations 表（同一 location 至多一条，由唯一索引
+idx_confirm_loc_unique 保证），同名门禁策略的每次提交都以递增 revision
+追加到 policy_revisions 表。
 """
 from __future__ import annotations
 
@@ -114,6 +115,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_confirm_loc_unique
 CREATE INDEX IF NOT EXISTS idx_dependencies_doc ON dependencies (document_id);
 CREATE INDEX IF NOT EXISTS idx_completions_doc  ON completions (document_id);
 CREATE INDEX IF NOT EXISTS idx_policy_name      ON policy_revisions (name, revision);
+
+-- 成功回传的离线审阅包（只追加；同 package_id 重复回传直接返回首次结果，
+-- 不重复写入）。创建（冻结）只读不写，回传成功后在同一写事务内追加一行，
+-- result_json 为首次应用结果的规范化 JSON（用于幂等重放）。
+CREATE TABLE IF NOT EXISTS review_packages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id  TEXT NOT NULL UNIQUE,
+    document_id INTEGER NOT NULL REFERENCES documents (id),
+    digest      TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_review_packages_doc ON review_packages (document_id);
 """
 
 

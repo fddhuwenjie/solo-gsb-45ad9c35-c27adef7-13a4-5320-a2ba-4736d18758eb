@@ -48,6 +48,13 @@
   一次构建边界映射，整批 O(n + m)；越界、start > end、端点落入 UTF-16
   代理对或 UTF-8 多字节字符内部时整批 422 并指出条目与端点，绝不取整；
   接口只读，相同快照结果稳定。
+- 可离线往返的审阅包：创建时在同一个 SQLite 读事务中冻结指定批注的最新
+  迁移记录、候选范围、完成状态及全部传递前置状态（含包外前置的最新位置），
+  生成 package_id 与内容摘要，只收录当时可确认、可完成或能由同包前置项
+  解锁的条目；回传时原样携带包体、摘要与每项确认 / 完成决定，目标已被
+  确认、完成状态变化或新版本改变最新位置时整包返回可定位冲突（409）且不
+  写入；无冲突时在同一个写事务中按包内拓扑序追加，后项可由前项解锁，任一
+  决定非法整批回滚；同一 package_id 的成功回传返回首次结果，不重复写入。
 """
 from __future__ import annotations
 
@@ -64,6 +71,7 @@ from . import coordinates as coords_mod
 from . import db
 from . import events as events_mod
 from . import gate as gate_mod
+from . import packages as pkg_mod
 from .diffing import (
     classify_range,
     compute_segments,
@@ -97,6 +105,8 @@ from .schemas import (
     DocumentCreate,
     PolicyCreate,
     RedactionCreate,
+    ReviewPackageCreate,
+    ReviewPackageSubmit,
     VersionCreate,
 )
 
@@ -109,7 +119,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -128,6 +138,10 @@ app = FastAPI(
         "以及批量偏移换算：同一读事务按目标版本全文一次构建 "
         "codepoint / utf16 / utf8_byte 边界映射，整批 O(n+m) 互转半开区间，"
         "代理对或多字节字符内部、越界、start>end 整批 422，绝不取整。"
+        "另提供可离线往返的审阅包：同一读事务冻结最新迁移记录、候选范围、"
+        "完成状态与全部传递前置状态并生成 package_id 与内容摘要，"
+        "回传时整包冲突定位（已确认/已完成/新版本改变最新位置则不写入），"
+        "无冲突按包内依赖顺序在同一写事务追加确认与完成，重复回传幂等不重写。"
     ),
     lifespan=lifespan,
 )
@@ -269,7 +283,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.8.0",
+        "version": "1.9.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -1639,6 +1653,134 @@ def verify_archive_endpoint(payload: ArchiveVerifyRequest):
             "confirmations": len(arch["confirmations"]),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 可离线往返的审阅包：同读事务冻结 → 离线填写 → 同写事务整包回传
+# ---------------------------------------------------------------------------
+
+
+_PKG_DIGEST_DESCRIPTION = (
+    "摘要算法：sha256(json.dumps(package, ensure_ascii=False, "
+    "sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()"
+)
+
+
+def _package_create_error(batch: pkg_mod.PackageErrorBatch, status_code: int):
+    return HTTPException(
+        status_code,
+        detail={
+            "message": "审阅包创建失败，未生成审阅包"
+            if status_code == 422
+            else "审阅包回传失败，未写入任何决定",
+            "errors": [e.to_dict() for e in batch.errors],
+        },
+    )
+
+
+@app.post("/documents/{document_id}/review-packages", status_code=201)
+def create_review_package(
+    document_id: int, payload: ReviewPackageCreate, con=Depends(get_db)
+):
+    """创建可离线往返的审阅包（只读，不写入任何数据）。
+
+    在**同一个 SQLite 读事务**（同一快照）中冻结请求批注的：
+
+    - **最新迁移记录**：状态、范围、匹配依据、全部候选范围、顺延标记与
+      所在版本（``items[].latest``）；
+    - **完成状态**与当时是否已有人工确认；
+    - **全部传递前置项**及其完成状态（前置项同样冻结最新位置，
+      ``requested=false`` 的条目即为前置项）。
+
+    只收录当时**可确认**（最新位置为非顺延的未确认歧义）、**可完成**
+    （未完成）或**能由同包前置项解锁**（未完成的传递前置项也在请求列表中）
+    的条目。显式请求中存在重复 / 不存在 / 跨文档批注，或条目已完成且无歧义、
+    被包外前置项阻塞时，**整批返回 422**，``detail.errors`` 一次性列出带
+    ``annotation_ids[i]`` 定位的全部问题，不生成包。
+
+    响应给出 ``package_id``（``rp_`` + 32 位十六进制）与包内容 ``digest``
+    （规范化 JSON 的 SHA-256，算法与归档相同）。``items`` 已按**包内依赖
+    拓扑序**排列（前置在前）；``items[].actions`` 标明该条目离线允许的决定。
+    审阅人可在完全离线的环境中保存包体并填写决定，日后原样回传。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        try:
+            package = pkg_mod.build_package(
+                con, document_id, payload.annotation_ids
+            )
+        except pkg_mod.PackageErrorBatch as batch:
+            raise _package_create_error(batch, 422)
+    package_id = pkg_mod.new_package_id()
+    digest = pkg_mod.compute_digest(package)
+    return {
+        "document_id": document_id,
+        "package_id": package_id,
+        "format": pkg_mod.PACKAGE_FORMAT,
+        "digest": digest,
+        "digest_algorithm": _PKG_DIGEST_DESCRIPTION,
+        "package": package,
+    }
+
+
+@app.post("/documents/{document_id}/review-packages/submit", status_code=201)
+def submit_review_package(
+    document_id: int, payload: ReviewPackageSubmit, response: Response,
+    con=Depends(get_db),
+):
+    """回传离线填写的审阅包：无冲突时整包追加确认与完成，否则全部不写入。
+
+    请求体须**原样携带创建时的包内容与摘要**及每项确认 / 完成决定。
+    在**同一个 BEGIN IMMEDIATE 写事务**内：
+
+    1. 复算摘要（包体被改动 → ``digest_mismatch``，422），校验归属 /
+       决定目标与包内条目对齐；
+    2. 逐条做**冲突检测**（整包 409，``detail.errors`` 按 ``items[i]`` 定位，
+       **不写入任何一行**）：
+
+       - ``location_confirmed``：目标歧义记录在包创建后已被确认；
+       - ``already_completed``：目标在包创建后已被完成（包内完成决定会重复）；
+       - ``latest_location_changed``：冻结后出现新版本，最新迁移记录已改变；
+       - ``prerequisites_changed``：依赖图新增 / 移除了传递前置项；
+
+    3. 无冲突后按**包内依赖顺序（拓扑序）**逐条追加：确认决定的范围必须
+       属于冻结候选（``bad_candidate``），完成决定要求其全部传递前置项在
+       应用到该条时已完成（包外前置冻结时已完成，包内前置由同包前项解锁；
+       否则 ``blocked``）。**任一决定非法则整包回滚**（422，不写入）。
+
+    确认与完成均只追加（confirmations / completions），响应按应用顺序给出
+    每条结果及完成决定新解锁的包内后续项。**同一 package_id 的成功回传**
+    直接返回首次结果（``replay=true``，HTTP 200），**不重复写入**；
+    用同一 package_id 回传到其他文档返回 422。
+    """
+    package = payload.package.model_dump(mode="json")
+    decisions = [d.model_dump(mode="json") for d in payload.decisions]
+    with db.transaction(con):
+        _get_document(con, document_id)
+        try:
+            result = pkg_mod.apply_package(
+                con,
+                document_id,
+                package,
+                payload.digest,
+                decisions,
+                payload.package_id,
+            )
+        except pkg_mod.PackageErrorBatch as batch:
+            codes = {e.error for e in batch.errors}
+            conflict_codes = {
+                "location_confirmed",
+                "already_completed",
+                "completion_removed",
+                "latest_location_changed",
+                "prerequisites_changed",
+                "outside_prerequisite_not_completed",
+            }
+            status = 409 if codes <= conflict_codes else 422
+            raise _package_create_error(batch, status)
+    if result.get("replay"):
+        response.status_code = 200
+    return result
 
 
 # ---------------------------------------------------------------------------
